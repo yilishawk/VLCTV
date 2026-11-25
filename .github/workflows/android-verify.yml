@@ -15,6 +15,11 @@ on:
           - both
           - armeabi_v7a
           - arm64_v8a
+      app_id_suffix:
+        description: "Co-existence suffix appended to application id (blank = com.fongmi.android.tv)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -68,6 +73,11 @@ jobs:
               TASKS=":app:assembleLeanbackArmeabi_v7aDebug :app:assembleLeanbackArm64_v8aDebug"
               ;;
           esac
+          SUFFIX="$(printf '%s' '${{ inputs.app_id_suffix }}' | tr -cd 'A-Za-z0-9._-')"
+          if [ -n "$SUFFIX" ]; then
+            export WEBHTV_APP_ID_SUFFIX="$SUFFIX"
+            echo "Building with applicationId suffix: .$SUFFIX"
+          fi
           ./gradlew $TASKS --no-daemon --stacktrace
 
       - name: Collect APKs
@@ -87,6 +97,15 @@ jobs:
               echo "ERROR: libvlc.so missing in $apk" >&2
               exit 1
             }
+          done
+
+      - name: Report application ids
+        shell: bash
+        run: |
+          AAPT="$(find "$ANDROID_HOME/build-tools" -name aapt2 -type f | sort -V | tail -1)"
+          for apk in verify-apks/*.apk; do
+            echo -n "$apk -> "
+            "$AAPT" dump badging "$apk" 2>/dev/null | sed -n "s/^package: name='\([^']*\)'.*/\1/p"
           done
 
       - name: Upload APKs
