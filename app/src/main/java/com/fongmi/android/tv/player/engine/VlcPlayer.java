@@ -16,6 +16,7 @@ import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
 import androidx.media3.common.SimpleBasePlayer;
+import androidx.media3.common.TrackGroup;
 import androidx.media3.common.Tracks;
 import androidx.media3.common.VideoSize;
 import androidx.media3.common.util.UnstableApi;
@@ -41,7 +42,7 @@ import java.util.List;
  * used by IjkSimplePlayer and MpvPlayer in this project.
  */
 @UnstableApi
-class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener {
+class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, IVLCVout.OnNewVideoLayoutListener {
 
     private static final String TAG = "VlcPlayer";
 
@@ -241,9 +242,30 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener {
             } else {
                 return;
             }
-            vout.attachViews();
+            vout.attachViews(this);
         } catch (Throwable error) {
             clearOutput();
+        }
+    }
+
+    /**
+     * VLC reports the decoded video geometry here. Feed it into media3's VideoSize so
+     * PlayerView lays the SurfaceView out with the right aspect ratio, and echo the
+     * visible size back to VLC via setWindowSize so its window module stops issuing
+     * unhandled "request 3" (window resize) calls. Without this, the picture is
+     * stretched in small mode and anchored/cropped in fullscreen.
+     */
+    @Override
+    public void onNewVideoLayout(IVLCVout vout, int width, int height,
+                                 int visibleWidth, int visibleHeight, int sarNum, int sarDen) {
+        int w = visibleWidth > 0 ? visibleWidth : width;
+        int h = visibleHeight > 0 ? visibleHeight : height;
+        if (w > 0 && h > 0) {
+            float sar = sarDen > 0 && sarNum > 0 ? (float) sarNum / sarDen : 1f;
+            int pixelWidth = Math.round(w * sar);
+            videoSize = new VideoSize(pixelWidth, h);
+            vout.setWindowSize(w, h);
+            invalidateState();
         }
     }
 
@@ -261,14 +283,65 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener {
     }
 
     /**
-     * Track enumeration/selection is intentionally not wired in the first VLC build.
-     * This keeps the media3 adapter minimal and avoids guessing this fork's
-     * Format/Tracks.Group contract. VLC still selects its own default tracks;
-     * app-side track switching can be added once playback is verified on device.
+     * Build the media3 track list from VLC's track descriptions. This fork encodes the
+     * track type in the TrackGroup id ("vlc:<type>:<id>") so group.getType() resolves
+     * correctly; Format.id is "<type>:<id>" which the UI stores as Track.playerId and
+     * is later parsed back by VlcPlayerEngine.setTrack().
      */
     private void refreshTracks() {
-        currentTracks = Tracks.EMPTY;
+        try {
+            List<Tracks.Group> groups = new ArrayList<>();
+            appendTracks(groups, C.TRACK_TYPE_VIDEO, vlc.getVideoTracks(), vlc.getVideoTrack());
+            appendTracks(groups, C.TRACK_TYPE_AUDIO, vlc.getAudioTracks(), vlc.getAudioTrack());
+            appendTracks(groups, C.TRACK_TYPE_TEXT, vlc.getSpuTracks(), vlc.getSpuTrack());
+            currentTracks = groups.isEmpty() ? Tracks.EMPTY : new Tracks(groups);
+        } catch (Throwable error) {
+            currentTracks = Tracks.EMPTY;
+        }
         invalidateState();
+    }
+
+    private void appendTracks(List<Tracks.Group> groups, int type,
+                              MediaPlayer.TrackDescription[] tracks, int selectedId) {
+        if (tracks == null) return;
+        for (MediaPlayer.TrackDescription track : tracks) {
+            String mime = type == C.TRACK_TYPE_VIDEO ? androidx.media3.common.MimeTypes.VIDEO_UNKNOWN
+                    : type == C.TRACK_TYPE_AUDIO ? androidx.media3.common.MimeTypes.AUDIO_UNKNOWN
+                    : androidx.media3.common.MimeTypes.TEXT_UNKNOWN;
+            Format format = new Format.Builder()
+                    .setId(type + ":" + track.id)
+                    .setLabel(track.name)
+                    .setSampleMimeType(mime)
+                    .build();
+            TrackGroup group = new TrackGroup("vlc:" + type + ":" + track.id, format);
+            boolean selected = track.id == selectedId;
+            groups.add(new Tracks.Group(group, false, new int[]{C.FORMAT_HANDLED}, new boolean[]{selected}));
+        }
+    }
+
+    /** Select a VLC track by its native id. type is a media3 C.TRACK_TYPE_* value. */
+    void selectTrack(int type, int trackId) {
+        switch (type) {
+            case C.TRACK_TYPE_VIDEO -> vlc.setVideoTrack(trackId);
+            case C.TRACK_TYPE_AUDIO -> vlc.setAudioTrack(trackId);
+            case C.TRACK_TYPE_TEXT -> vlc.setSpuTrack(trackId);
+            default -> {
+            }
+        }
+        refreshTracks();
+    }
+
+    void resetTrack() {
+        int video = firstTrackId(vlc.getVideoTracks());
+        int audio = firstTrackId(vlc.getAudioTracks());
+        if (video >= 0) vlc.setVideoTrack(video);
+        if (audio >= 0) vlc.setAudioTrack(audio);
+        vlc.setSpuTrack(-1);
+        refreshTracks();
+    }
+
+    private static int firstTrackId(MediaPlayer.TrackDescription[] tracks) {
+        return tracks != null && tracks.length > 0 ? tracks[0].id : -1;
     }
 
     @Override
@@ -437,6 +510,9 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener {
                 invalidateState();
             }
             case MediaPlayer.Event.Vout -> {
+                // Vout is created asynchronously after play(); attach here if the surface
+                // arrived earlier, otherwise the first frames render at the wrong size.
+                if (videoOutput != null && !vlc.getVLCVout().areViewsAttached()) attachOutput();
                 newlyRenderedFirstFrame = true;
                 invalidateState();
             }

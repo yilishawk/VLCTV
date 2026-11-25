@@ -124,11 +124,34 @@ public class VlcPlayerEngine implements PlayerEngine {
 
     @Override
     public void setTrack(List<Track> tracks) {
-        // VLC selects its own default tracks in this first build; app-side selection is deferred.
+        if (tracks == null) return;
+        for (Track track : tracks) {
+            if (track.isDisabled()) {
+                if (track.getType() == C.TRACK_TYPE_TEXT) player.selectTrack(C.TRACK_TYPE_TEXT, -1);
+                continue;
+            }
+            int[] ids = parseTrackId(track.getPlayerId());
+            if (ids != null) player.selectTrack(ids[0], ids[1]);
+        }
     }
 
     @Override
     public void resetTrack() {
+        player.resetTrack();
+    }
+
+    /** playerId is Format.id = "<media3Type>:<vlcNativeTrackId>". */
+    private static int[] parseTrackId(String playerId) {
+        if (playerId == null) return null;
+        int split = playerId.indexOf(':');
+        if (split <= 0 || split + 1 >= playerId.length()) return null;
+        try {
+            int type = Integer.parseInt(playerId.substring(0, split));
+            int id = Integer.parseInt(playerId.substring(split + 1));
+            return new int[]{type, id};
+        } catch (NumberFormatException error) {
+            return null;
+        }
     }
 
     @Override
