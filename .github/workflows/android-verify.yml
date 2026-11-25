@@ -15,6 +15,15 @@ on:
           - both
           - armeabi_v7a
           - arm64_v8a
+      mode:
+        description: "Which app mode to build (leanback = TV, mobile = phone)"
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - leanback
+          - mobile
       app_id_suffix:
         description: "Co-existence suffix appended to application id (blank = com.fongmi.android.tv)"
         required: false
@@ -58,21 +67,27 @@ jobs:
         run: |
           sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "cmake;3.22.1"
 
-      - name: Build (selected ABI)
+      - name: Build (selected mode + ABI)
         shell: bash
         run: |
           chmod +x ./gradlew
-          case "${{ inputs.abi }}" in
-            armeabi_v7a)
-              TASKS=":app:assembleLeanbackArmeabi_v7aDebug"
-              ;;
-            arm64_v8a)
-              TASKS=":app:assembleLeanbackArm64_v8aDebug"
-              ;;
-            *)
-              TASKS=":app:assembleLeanbackArmeabi_v7aDebug :app:assembleLeanbackArm64_v8aDebug"
-              ;;
+          case "${{ inputs.mode }}" in
+            leanback) MODES="leanback" ;;
+            mobile)   MODES="mobile" ;;
+            *)        MODES="leanback mobile" ;;
           esac
+          case "${{ inputs.abi }}" in
+            armeabi_v7a) ABIS="armeabi_v7a" ;;
+            arm64_v8a)   ABIS="arm64_v8a" ;;
+            *)           ABIS="armeabi_v7a arm64_v8a" ;;
+          esac
+          TASKS=""
+          for m in $MODES; do
+            for a in $ABIS; do
+              TASKS="$TASKS :app:assemble${m^}${a}Debug"
+            done
+          done
+          echo "Tasks:$TASKS"
           SUFFIX="$(printf '%s' '${{ inputs.app_id_suffix }}' | tr -cd 'A-Za-z0-9._-')"
           if [ -n "$SUFFIX" ]; then
             export WEBHTV_APP_ID_SUFFIX="$SUFFIX"
