@@ -3,7 +3,9 @@ package com.fongmi.android.tv.player.engine;
 import android.content.Context;
 import android.net.Uri;
 import android.os.Looper;
+import android.util.Log;
 import android.view.Surface;
+import android.view.View;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.TextureView;
@@ -242,32 +244,78 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
             } else {
                 return;
             }
+            if (videoOutput instanceof View view) view.addOnLayoutChangeListener(layoutListener);
             vout.attachViews(this);
+            Log.d(TAG, "attachOutput " + describeOutput(videoOutput));
         } catch (Throwable error) {
             clearOutput();
         }
     }
 
     /**
-     * VLC reports the decoded video geometry here. Feed it into media3's VideoSize so
-     * PlayerView lays the SurfaceView out with the right aspect ratio, and echo the
-     * visible size back to VLC via setWindowSize so its window module stops issuing
-     * unhandled "request 3" (window resize) calls. Without this, the picture is
-     * stretched in small mode and anchored/cropped in fullscreen.
+     * VLC reports the decoded video geometry here. Feed the display aspect ratio into
+     * media3's VideoSize so PlayerView lays out the SurfaceView correctly, and tell VLC
+     * the ACTUAL surface pixel size via setWindowSize. Passing the decoded video size
+     * (the old behaviour) makes VLC lay the picture out as if the window were 1920x1080
+     * while the surface is only e.g. 960x540, producing a shrunken, corner-anchored
+     * image in fullscreen.
      */
     @Override
     public void onNewVideoLayout(IVLCVout vout, int width, int height,
                                  int visibleWidth, int visibleHeight, int sarNum, int sarDen) {
         int w = visibleWidth > 0 ? visibleWidth : width;
         int h = visibleHeight > 0 ? visibleHeight : height;
+        Log.d(TAG, "layout cb video=" + width + "x" + height + " visible=" + w + "x" + h
+                + " sar=" + sarNum + "/" + sarDen + " output=" + describeOutput(videoOutput));
         if (w > 0 && h > 0) {
             float sar = sarDen > 0 && sarNum > 0 ? (float) sarNum / sarDen : 1f;
             int pixelWidth = Math.round(w * sar);
-            videoSize = new VideoSize(pixelWidth, h);
-            vout.setWindowSize(w, h);
-            invalidateState();
+            VideoSize size = new VideoSize(pixelWidth, h);
+            if (!size.equals(videoSize)) {
+                videoSize = size;
+                invalidateState();
+            }
+        }
+        applyWindowSize();
+    }
+
+    /** Tell VLC the real pixel size of the current output surface. */
+    private void applyWindowSize() {
+        if (videoOutput == null) return;
+        int[] size = outputSize(videoOutput);
+        if (size == null || size[0] <= 0 || size[1] <= 0) return;
+        try {
+            vlc.getVLCVout().setWindowSize(size[0], size[1]);
+            Log.d(TAG, "setWindowSize " + size[0] + "x" + size[1]);
+        } catch (Throwable error) {
+            Log.w(TAG, "setWindowSize failed", error);
         }
     }
+
+    private static int[] outputSize(Object output) {
+        if (output instanceof SurfaceView surfaceView)
+            return new int[]{surfaceView.getWidth(), surfaceView.getHeight()};
+        if (output instanceof TextureView textureView)
+            return new int[]{textureView.getWidth(), textureView.getHeight()};
+        if (output instanceof SurfaceHolder holder) {
+            android.graphics.Rect frame = holder.getSurfaceFrame();
+            return new int[]{frame.width(), frame.height()};
+        }
+        return null;
+    }
+
+    private static String describeOutput(Object output) {
+        int[] size = outputSize(output);
+        String cls = output == null ? "null" : output.getClass().getSimpleName();
+        return cls + (size == null ? "" : " " + size[0] + "x" + size[1]);
+    }
+
+    private final View.OnLayoutChangeListener layoutListener = (v, l, t, r, b, ol, ot, or, ob) -> {
+        if (r - l != or - ol || b - t != ob - ot) {
+            Log.d(TAG, "output resized " + describeOutput(videoOutput));
+            applyWindowSize();
+        }
+    };
 
     private void clearOutput() {
         try {
@@ -278,6 +326,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
     }
 
     private void clearVideoOutput() {
+        if (videoOutput instanceof View view) view.removeOnLayoutChangeListener(layoutListener);
         clearOutput();
         videoOutput = null;
     }
