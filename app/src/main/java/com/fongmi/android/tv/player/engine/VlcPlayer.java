@@ -1,0 +1,449 @@
+package com.fongmi.android.tv.player.engine;
+
+import android.content.Context;
+import android.net.Uri;
+import android.os.Looper;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.TextureView;
+
+import androidx.annotation.Nullable;
+import androidx.media3.common.C;
+import androidx.media3.common.Format;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.PlaybackParameters;
+import androidx.media3.common.Player;
+import androidx.media3.common.SimpleBasePlayer;
+import androidx.media3.common.Tracks;
+import androidx.media3.common.VideoSize;
+import androidx.media3.common.util.UnstableApi;
+
+import com.fongmi.android.tv.App;
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+
+import org.videolan.libvlc.LibVLC;
+import org.videolan.libvlc.Media;
+import org.videolan.libvlc.MediaPlayer;
+import org.videolan.libvlc.interfaces.IVLCVout;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Media3 {@link SimpleBasePlayer} adapter around LibVLC.
+ *
+ * <p>Keeps the rest of the app untouched: the app only talks to the media3 Player
+ * interface, while VLC does the actual decoding/rendering. This is the same shape
+ * used by IjkSimplePlayer and MpvPlayer in this project.
+ */
+@UnstableApi
+class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener {
+
+    private static final String TAG = "VlcPlayer";
+
+    private static final Commands COMMANDS = new Commands.Builder()
+            .add(COMMAND_PLAY_PAUSE)
+            .add(COMMAND_PREPARE)
+            .add(COMMAND_STOP)
+            .add(COMMAND_RELEASE)
+            .add(COMMAND_SET_REPEAT_MODE)
+            .add(COMMAND_GET_CURRENT_MEDIA_ITEM)
+            .add(COMMAND_GET_TIMELINE)
+            .add(COMMAND_GET_METADATA)
+            .add(COMMAND_SET_MEDIA_ITEM)
+            .add(COMMAND_CHANGE_MEDIA_ITEMS)
+            .add(COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)
+            .add(COMMAND_SEEK_TO_DEFAULT_POSITION)
+            .add(COMMAND_GET_VOLUME)
+            .add(COMMAND_SET_VOLUME)
+            .add(COMMAND_SET_SPEED_AND_PITCH)
+            .add(COMMAND_SET_VIDEO_SURFACE)
+            .add(COMMAND_GET_TRACKS)
+            .build();
+
+    private final LibVLC libVLC;
+    private final MediaPlayer vlc;
+    private final int decode;
+
+    private MediaItem mediaItem;
+    private Object videoOutput;
+    private PlaybackParameters playbackParameters = PlaybackParameters.DEFAULT;
+    private PlaybackException playerError;
+    private Tracks currentTracks = Tracks.EMPTY;
+    private VideoSize videoSize = VideoSize.UNKNOWN;
+    private int playbackState = Player.STATE_IDLE;
+    private boolean playWhenReady = true;
+    private boolean loading;
+    private boolean repeatOne;
+    private boolean prepared;
+    private boolean newlyRenderedFirstFrame;
+    private float volume = 1f;
+    private long pendingSeekMs = C.TIME_UNSET;
+
+    VlcPlayer(int decode) {
+        super(Looper.getMainLooper());
+        this.decode = decode;
+        Context context = App.get();
+        List<String> args = new ArrayList<>();
+        args.add("--no-video-title-show");
+        args.add("--network-caching=1000");
+        args.add("--no-osd");
+        if (decode == PlayerEngine.SOFT) args.add("--avcodec-hw=none");
+        libVLC = new LibVLC(context, args);
+        vlc = new MediaPlayer(libVLC);
+        vlc.setEventListener(this);
+    }
+
+    int getDecode() {
+        return decode;
+    }
+
+    Tracks getCurrentTracksSnapshot() {
+        return currentTracks;
+    }
+
+    @Nullable
+    Format getSelectedVideoFormatSnapshot() {
+        Format format = findSelectedFormat(C.TRACK_TYPE_VIDEO);
+        return format;
+    }
+
+    @Nullable
+    Format getSelectedAudioFormatSnapshot() {
+        return findSelectedFormat(C.TRACK_TYPE_AUDIO);
+    }
+
+    private Format findSelectedFormat(int trackType) {
+        if (currentTracks == null) return null;
+        for (Tracks.Group group : currentTracks.getGroups()) {
+            if (group.getType() != trackType) continue;
+            for (int i = 0; i < group.length; i++) {
+                if (group.isTrackSelected(i)) return group.getTrackFormat(i);
+            }
+        }
+        return null;
+    }
+
+    String getErrorMessageSnapshot() {
+        return playerError == null ? "" : String.valueOf(playerError.getMessage());
+    }
+
+    boolean isLiveSnapshot() {
+        long duration = durationMs();
+        return duration == C.TIME_UNSET || duration < java.util.concurrent.TimeUnit.MINUTES.toMillis(1);
+    }
+
+    @Override
+    protected State getState() {
+        int state = playbackState;
+        boolean isLoading = loading && state != Player.STATE_IDLE && state != Player.STATE_ENDED;
+        boolean firstFrame = newlyRenderedFirstFrame;
+        newlyRenderedFirstFrame = false;
+        State.Builder builder = new State.Builder()
+                .setAvailableCommands(COMMANDS)
+                .setPlayWhenReady(playWhenReady, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
+                .setPlaybackState(state)
+                .setIsLoading(isLoading)
+                .setPlayerError(playerError)
+                .setRepeatMode(repeatOne ? Player.REPEAT_MODE_ONE : Player.REPEAT_MODE_OFF)
+                .setPlaybackParameters(playbackParameters)
+                .setVideoSize(videoSize)
+                .setNewlyRenderedFirstFrame(firstFrame)
+                .setVolume(volume)
+                .setPlaylist(mediaItem == null ? ImmutableList.of() : ImmutableList.of(mediaItemData()))
+                .setCurrentMediaItemIndex(mediaItem == null ? C.INDEX_UNSET : 0);
+        if (mediaItem != null) {
+            long duration = durationMs();
+            long position = positionMs();
+            long buffered = Math.max(position, Math.min(duration == C.TIME_UNSET ? position : duration, position + 1000));
+            builder.setContentPositionMs(isPlayingInternal()
+                    ? PositionSupplier.getExtrapolating(position, playbackParameters.speed)
+                    : PositionSupplier.getConstant(position));
+            builder.setContentBufferedPositionMs(PositionSupplier.getConstant(buffered));
+            builder.setTotalBufferedDurationMs(PositionSupplier.getConstant(Math.max(0, buffered - position)));
+        }
+        return builder.build();
+    }
+
+    private MediaItemData mediaItemData() {
+        long duration = durationMs();
+        return new MediaItemData.Builder(mediaItem.mediaId)
+                .setMediaItem(mediaItem)
+                .setMediaMetadata(mediaItem.mediaMetadata)
+                .setDurationUs(duration == C.TIME_UNSET ? C.TIME_UNSET : duration * 1000)
+                .setIsSeekable(true)
+                .setIsDynamic(false)
+                .setTracks(currentTracks)
+                .build();
+    }
+
+    private long durationMs() {
+        if (!prepared) return C.TIME_UNSET;
+        long length = vlc.getLength();
+        return length > 0 ? length : C.TIME_UNSET;
+    }
+
+    private long positionMs() {
+        if (!prepared) return 0;
+        long time = vlc.getTime();
+        return Math.max(0, time);
+    }
+
+    private boolean isPlayingInternal() {
+        return prepared && playbackState == Player.STATE_READY && vlc.isPlaying();
+    }
+
+    private void openCurrent() {
+        if (mediaItem == null) return;
+        String url = mediaItem.localConfiguration == null ? null : mediaItem.localConfiguration.uri.toString();
+        if (url == null || url.isEmpty()) {
+            playerError = new PlaybackException("VLC empty url", null, PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS);
+            invalidateState();
+            return;
+        }
+        vlc.stop();
+        releaseMedia();
+        Media media = new Media(libVLC, Uri.parse(url));
+        if (decode == PlayerEngine.SOFT) media.setHWDecoderEnabled(false, false);
+        if (repeatOne) media.addOption(":input-repeat=65535");
+        prepared = false;
+        loading = true;
+        playbackState = Player.STATE_BUFFERING;
+        playerError = null;
+        vlc.setMedia(media);
+        media.release();
+        attachOutput();
+        if (playWhenReady) vlc.play();
+        invalidateState();
+    }
+
+    private void releaseMedia() {
+        org.videolan.libvlc.interfaces.IMedia media = vlc.getMedia();
+        if (media != null) media.release();
+    }
+
+    private void attachOutput() {
+        IVLCVout vout = vlc.getVLCVout();
+        if (videoOutput == null || vout.areViewsAttached()) return;
+        try {
+            if (videoOutput instanceof SurfaceView surfaceView) {
+                vout.setVideoView(surfaceView);
+            } else if (videoOutput instanceof TextureView textureView) {
+                vout.setVideoView(textureView);
+            } else if (videoOutput instanceof SurfaceHolder holder) {
+                vout.setVideoSurface((Surface) null, holder);
+            } else if (videoOutput instanceof Surface surface) {
+                vout.setVideoSurface(surface, null);
+            } else {
+                return;
+            }
+            vout.attachViews();
+        } catch (Throwable error) {
+            clearOutput();
+        }
+    }
+
+    private void clearOutput() {
+        try {
+            IVLCVout vout = vlc.getVLCVout();
+            if (vout.areViewsAttached()) vout.detachViews();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void clearVideoOutput() {
+        clearOutput();
+        videoOutput = null;
+    }
+
+    /**
+     * Track enumeration/selection is intentionally not wired in the first VLC build.
+     * This keeps the media3 adapter minimal and avoids guessing this fork's
+     * Format/Tracks.Group contract. VLC still selects its own default tracks;
+     * app-side track switching can be added once playback is verified on device.
+     */
+    private void refreshTracks() {
+        currentTracks = Tracks.EMPTY;
+        invalidateState();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSetMediaItems(List<MediaItem> mediaItems, int startIndex, long startPositionMs) {
+        mediaItem = mediaItems.isEmpty() ? null : mediaItems.get(0);
+        pendingSeekMs = startPositionMs > 0 ? startPositionMs : C.TIME_UNSET;
+        playbackState = Player.STATE_IDLE;
+        loading = false;
+        prepared = false;
+        playerError = null;
+        currentTracks = Tracks.EMPTY;
+        videoSize = VideoSize.UNKNOWN;
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleAddMediaItems(int index, List<MediaItem> mediaItems) {
+        if (mediaItem == null && !mediaItems.isEmpty()) mediaItem = mediaItems.get(0);
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleReplaceMediaItems(int fromIndex, int toIndex, List<MediaItem> mediaItems) {
+        mediaItem = mediaItems.isEmpty() ? null : mediaItems.get(0);
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleRemoveMediaItems(int fromIndex, int toIndex) {
+        mediaItem = null;
+        playbackState = Player.STATE_IDLE;
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handlePrepare() {
+        openCurrent();
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSetPlayWhenReady(boolean playWhenReady) {
+        this.playWhenReady = playWhenReady;
+        if (prepared) {
+            if (playWhenReady) vlc.play();
+            else vlc.pause();
+        }
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleStop() {
+        stopInternal();
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleRelease() {
+        stopInternal();
+        clearOutput();
+        vlc.setEventListener(null);
+        vlc.release();
+        libVLC.release();
+        return Futures.immediateVoidFuture();
+    }
+
+    private void stopInternal() {
+        try {
+            vlc.stop();
+        } catch (Throwable ignored) {
+        }
+        releaseMedia();
+        prepared = false;
+        loading = false;
+        playbackState = Player.STATE_IDLE;
+        currentTracks = Tracks.EMPTY;
+        videoSize = VideoSize.UNKNOWN;
+        invalidateState();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSetRepeatMode(int repeatMode) {
+        repeatOne = repeatMode == Player.REPEAT_MODE_ONE;
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSeek(int mediaItemIndex, long positionMs, int seekCommand) {
+        if (positionMs == C.TIME_UNSET) positionMs = 0;
+        pendingSeekMs = positionMs;
+        if (prepared) vlc.setTime(positionMs, false);
+        invalidateState();
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSetPlaybackParameters(PlaybackParameters playbackParameters) {
+        this.playbackParameters = playbackParameters;
+        vlc.setRate(playbackParameters.speed);
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSetVolume(float volume, int volumeOperationType) {
+        this.volume = volume;
+        vlc.setVolume(Math.round(volume * 100));
+        invalidateState();
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleSetVideoOutput(Object videoOutput) {
+        this.videoOutput = videoOutput;
+        attachOutput();
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    protected ListenableFuture<?> handleClearVideoOutput(@Nullable Object videoOutput) {
+        if (videoOutput == null || videoOutput == this.videoOutput) clearVideoOutput();
+        return Futures.immediateVoidFuture();
+    }
+
+    @Override
+    public void onEvent(MediaPlayer.Event event) {
+        switch (event.type) {
+            case MediaPlayer.Event.Opening -> {
+                loading = true;
+                playbackState = Player.STATE_BUFFERING;
+                invalidateState();
+            }
+            case MediaPlayer.Event.Buffering -> {
+                loading = event.getBuffering() < 100;
+                invalidateState();
+            }
+            case MediaPlayer.Event.Playing -> {
+                prepared = true;
+                loading = false;
+                playbackState = Player.STATE_READY;
+                vlc.setRate(playbackParameters.speed);
+                vlc.setVolume(Math.round(volume * 100));
+                if (pendingSeekMs != C.TIME_UNSET) {
+                    vlc.setTime(pendingSeekMs, false);
+                    pendingSeekMs = C.TIME_UNSET;
+                }
+                refreshTracks();
+                invalidateState();
+            }
+            case MediaPlayer.Event.Paused -> {
+                playbackState = Player.STATE_READY;
+                invalidateState();
+            }
+            case MediaPlayer.Event.Stopped -> {
+                playbackState = Player.STATE_IDLE;
+                invalidateState();
+            }
+            case MediaPlayer.Event.EndReached -> {
+                playbackState = Player.STATE_ENDED;
+                invalidateState();
+            }
+            case MediaPlayer.Event.EncounteredError -> {
+                playerError = new PlaybackException("VLC playback error", null,
+                        PlaybackException.ERROR_CODE_IO_UNSPECIFIED);
+                loading = false;
+                playbackState = Player.STATE_IDLE;
+                invalidateState();
+            }
+            case MediaPlayer.Event.Vout -> {
+                newlyRenderedFirstFrame = true;
+                invalidateState();
+            }
+            case MediaPlayer.Event.LengthChanged, MediaPlayer.Event.TimeChanged -> invalidateState();
+            case MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected, MediaPlayer.Event.ESDeleted -> refreshTracks();
+            default -> {
+            }
+        }
+    }
+}

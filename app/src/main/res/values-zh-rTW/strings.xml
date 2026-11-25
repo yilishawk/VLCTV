@@ -1192,6 +1192,7 @@
         <item>EXO</item>
         <item>IJK</item>
         <item>MPV</item>
+        <item>VLC</item>
     </string-array>
     <string-array name="select_buffer_bytes">
         <item>自動</item>

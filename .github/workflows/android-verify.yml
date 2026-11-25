@@ -1,0 +1,98 @@
+name: Android Verify Build
+
+# VLCTV-only build verification: compiles both ABIs and uploads the APKs as
+# workflow artifacts. It deliberately does NOT create a release, update
+# manifests, or touch CNB/OCI, so it is safe to run on every validation push.
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "Which ABI to build"
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - armeabi_v7a
+          - arm64_v8a
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Verify build (${{ inputs.abi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "cmake;3.22.1"
+
+      - name: Build (selected ABI)
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          case "${{ inputs.abi }}" in
+            armeabi_v7a)
+              TASKS=":app:assembleLeanbackArmeabi_v7aDebug"
+              ;;
+            arm64_v8a)
+              TASKS=":app:assembleLeanbackArm64_v8aDebug"
+              ;;
+            *)
+              TASKS=":app:assembleLeanbackArmeabi_v7aDebug :app:assembleLeanbackArm64_v8aDebug"
+              ;;
+          esac
+          ./gradlew $TASKS --no-daemon --stacktrace
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          mkdir -p verify-apks
+          find app/build/outputs/apk -name '*.apk' -exec cp -v {} verify-apks/ \;
+          ls -lh verify-apks/
+
+      - name: Verify VLC native library is packaged
+        shell: bash
+        run: |
+          set -euo pipefail
+          for apk in verify-apks/*.apk; do
+            echo "== $apk =="
+            unzip -l "$apk" | grep -E 'lib/(armeabi-v7a|arm64-v8a)/libvlc\.so' || {
+              echo "ERROR: libvlc.so missing in $apk" >&2
+              exit 1
+            }
+          done
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlctv-verify-apks-${{ inputs.abi }}
+          path: verify-apks/*.apk
+          if-no-files-found: error
+          retention-days: 14

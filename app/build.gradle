@@ -213,6 +213,7 @@ dependencies {
     implementation libs.bundles.media3
     implementation libs.exoplayer.hdr.utils
     implementation libs.nextlib.media3ext
+    implementation libs.libvlc.all
     implementation libs.palette
     implementation libs.recyclerview
     implementation libs.room.runtime

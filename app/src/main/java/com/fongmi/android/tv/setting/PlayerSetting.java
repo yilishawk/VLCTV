@@ -11,6 +11,7 @@ public class PlayerSetting {
     public static final int EXO = 0;
     public static final int IJK = 1;
     public static final int MPV = 2;
+    public static final int VLC = 3;
     public static final int RENDER_SURFACE = 0;
     public static final int RENDER_TEXTURE = 1;
     public static final int MPV_RENDER_OPENGL = 0;
@@ -92,17 +93,18 @@ public class PlayerSetting {
     }
 
     public static boolean isPlayer(int player) {
-        return player == EXO || player == IJK || player == MPV;
+        return player == EXO || player == IJK || player == MPV || player == VLC;
     }
 
     public static int sanitizePlayer(int player) {
-        return player == IJK || player == MPV ? player : EXO;
+        return player == IJK || player == MPV || player == VLC ? player : EXO;
     }
 
     public static int nextPlayer(int player) {
         return switch (sanitizePlayer(player)) {
             case EXO -> IJK;
             case IJK -> MPV;
+            case MPV -> VLC;
             default -> EXO;
         };
     }

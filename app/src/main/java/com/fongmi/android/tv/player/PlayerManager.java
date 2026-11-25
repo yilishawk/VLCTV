@@ -44,6 +44,7 @@ import com.fongmi.android.tv.player.engine.IjkPlayerEngine;
 import com.fongmi.android.tv.player.engine.MpvPlayerEngine;
 import com.fongmi.android.tv.player.engine.PlaySpec;
 import com.fongmi.android.tv.player.engine.PlayerCacheState;
+import com.fongmi.android.tv.player.engine.VlcPlayerEngine;
 import com.fongmi.android.tv.player.engine.PlayerEngine;
 import com.fongmi.android.tv.player.cache.PlaybackDiskBufferStore;
 import com.fongmi.android.tv.player.exo.ExoDecoderResourceRecoveryLimiter;
@@ -5098,6 +5099,7 @@ public class PlayerManager implements ParseCallback {
         return switch (type) {
             case PlayerSetting.IJK -> new IjkPlayerEngine(decode, listener);
             case PlayerSetting.MPV -> new MpvPlayerEngine(decode, listener, this::onMpvVideoSizeProbed, this::onMpvVideoTrackFailure);
+            case PlayerSetting.VLC -> new VlcPlayerEngine(decode, listener);
             default -> new ExoPlayerEngine(decode, listener);
         };
     }
