@@ -268,15 +268,35 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         Log.d(TAG, "layout cb video=" + width + "x" + height + " visible=" + w + "x" + h
                 + " sar=" + sarNum + "/" + sarDen + " output=" + describeOutput(videoOutput));
         if (w > 0 && h > 0) {
-            float sar = sarDen > 0 && sarNum > 0 ? (float) sarNum / sarDen : 1f;
-            int pixelWidth = Math.round(w * sar);
-            VideoSize size = new VideoSize(pixelWidth, h);
-            if (!size.equals(videoSize)) {
-                videoSize = size;
-                invalidateState();
-            }
+            publishVideoSize(w, h, sarNum, sarDen);
+        } else {
+            // VLC 3.7.8 reports 0x0 here in this binding; fall back to the current video track.
+            probeVideoSize();
         }
         applyWindowSize();
+    }
+
+    /** Read decoded geometry from VLC's current video track and publish it to media3. */
+    private void probeVideoSize() {
+        try {
+            org.videolan.libvlc.interfaces.IMedia.VideoTrack track = vlc.getCurrentVideoTrack();
+            if (track != null && track.width > 0 && track.height > 0) {
+                publishVideoSize(track.width, track.height, track.sarNum, track.sarDen);
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "probeVideoSize failed", error);
+        }
+    }
+
+    private void publishVideoSize(int w, int h, int sarNum, int sarDen) {
+        float sar = sarDen > 0 && sarNum > 0 ? (float) sarNum / sarDen : 1f;
+        int pixelWidth = Math.round(w * sar);
+        VideoSize size = new VideoSize(pixelWidth, h);
+        if (!size.equals(videoSize)) {
+            videoSize = size;
+            Log.d(TAG, "publishVideoSize " + pixelWidth + "x" + h + " sar=" + sarNum + "/" + sarDen);
+            invalidateState();
+        }
     }
 
     /** Tell VLC the real pixel size of the current output surface. */
@@ -537,6 +557,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
                     pendingSeekMs = C.TIME_UNSET;
                 }
                 refreshTracks();
+                probeVideoSize();
                 invalidateState();
             }
             case MediaPlayer.Event.Paused -> {
@@ -562,11 +583,15 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
                 // Vout is created asynchronously after play(); attach here if the surface
                 // arrived earlier, otherwise the first frames render at the wrong size.
                 if (videoOutput != null && !vlc.getVLCVout().areViewsAttached()) attachOutput();
+                probeVideoSize();
                 newlyRenderedFirstFrame = true;
                 invalidateState();
             }
             case MediaPlayer.Event.LengthChanged, MediaPlayer.Event.TimeChanged -> invalidateState();
-            case MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected, MediaPlayer.Event.ESDeleted -> refreshTracks();
+            case MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected, MediaPlayer.Event.ESDeleted -> {
+                refreshTracks();
+                probeVideoSize();
+            }
             default -> {
             }
         }
