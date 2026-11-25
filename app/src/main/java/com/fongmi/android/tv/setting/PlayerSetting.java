@@ -92,21 +92,28 @@ public class PlayerSetting {
         Prefers.put("audio_background_light_effect", enabled);
     }
 
+    /**
+     * Only EXO and VLC are user-selectable now. IJK/MPV constants are kept so the
+     * deep PlayerManager logic and the persisted-value contract still compile and
+     * stay stable, but they are remapped here at every entry point:
+     * legacy IJK(1) -> EXO(0), legacy MPV(2) -> VLC(3). See visiblePlayers().
+     */
     public static boolean isPlayer(int player) {
-        return player == EXO || player == IJK || player == MPV || player == VLC;
+        return player == EXO || player == VLC;
     }
 
     public static int sanitizePlayer(int player) {
-        return player == IJK || player == MPV || player == VLC ? player : EXO;
+        if (player == MPV || player == VLC) return VLC;
+        return EXO;
     }
 
     public static int nextPlayer(int player) {
-        return switch (sanitizePlayer(player)) {
-            case EXO -> IJK;
-            case IJK -> MPV;
-            case MPV -> VLC;
-            default -> EXO;
-        };
+        return sanitizePlayer(player) == EXO ? VLC : EXO;
+    }
+
+    /** The two user-facing kernel values, in display order. */
+    public static int[] visiblePlayers() {
+        return new int[]{EXO, VLC};
     }
 
     public static int getRender() {

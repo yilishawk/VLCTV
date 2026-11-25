@@ -22,20 +22,14 @@ public class LutEligibility {
         return getUnavailableReason(engine, spec, false);
     }
 
+    /**
+     * LUT was an MPV-native feature. With the IJK/MPV kernels removed it is retired:
+     * the UI and code are kept compiling, but every LUT operation is rejected here at
+     * this single gate so no dead MPV path can ever be reached.
+     */
     public static String getUnavailableReason(PlayerEngine engine, PlaySpec spec,
                                               boolean allowMpvSurfaceDirect) {
-        if (!allowMpvSurfaceDirect
-                && engine instanceof MpvPlayerEngine mpv && mpv.isSurfaceDirect()) {
-            return ResUtil.getString(R.string.lut_unavailable_output_mode);
-        }
-        if (engine == null || !engine.supportsLut()) return ResUtil.getString(R.string.lut_unavailable_player);
-        if (spec != null && spec.getDrm() != null) return ResUtil.getString(R.string.lut_unavailable_drm);
-        if (!engine.supportsNativeLut() && PlayerSetting.isTunnel()) return ResUtil.getString(R.string.lut_unavailable_tunnel);
-        if (!engine.supportsNativeLut() && engine.getDecode() == PlayerEngine.SOFT) return ResUtil.getString(R.string.lut_unavailable_soft_decode);
-        if (!engine.supportsNativeLut() && PlayerSetting.isVideoPrefer()) return ResUtil.getString(R.string.lut_unavailable_video_prefer);
-        if (isHdr(engine.getVideoFormat()) || isHdr(engine.getCurrentTracks())) return ResUtil.getString(R.string.lut_unavailable_hdr);
-        if (isKnownAudioOnly(engine.getCurrentTracks())) return ResUtil.getString(R.string.lut_unavailable_no_video);
-        return null;
+        return ResUtil.getString(R.string.lut_unavailable_player);
     }
 
     public static boolean isAvailable(PlayerEngine engine, PlaySpec spec) {
