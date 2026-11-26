@@ -10,6 +10,8 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.TextureView;
 
+import com.github.catvod.crawler.SpiderDebug;
+
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
@@ -33,6 +35,10 @@ import org.videolan.libvlc.Media;
 import org.videolan.libvlc.MediaPlayer;
 import org.videolan.libvlc.interfaces.IVLCVout;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -96,9 +102,39 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         args.add("--network-caching=1000");
         args.add("--no-osd");
         if (decode == PlayerEngine.SOFT) args.add("--avcodec-hw=none");
+        // Android 6 系统信任库没有 Let's Encrypt 的 ISRG Root X1（API 25 才加入），
+        // VLC native 只读系统 CA（so 内不带根），导致 LE 新链的源全部在打开阶段失败。
+        // 复用 app 自带的 Mozilla CA 包，让 VLC 的 gnutls 也能验通这些链。
+        String trustDir = prepareBundledTrustDir(context);
+        if (trustDir != null) args.add("--gnutls-dir-trust=" + trustDir);
         libVLC = new LibVLC(context, args);
         vlc = new MediaPlayer(libVLC);
         vlc.setEventListener(this);
+    }
+
+    /** 把 assets/cacert.pem 落到 filesDir 供 VLC gnutls 读取；失败返回 null，退回系统行为。 */
+    private static String prepareBundledTrustDir(Context context) {
+        File dir = new File(context.getFilesDir(), "vlc-trust");
+        File target = new File(dir, "cacert.pem");
+        try {
+            if (!target.exists() || target.length() == 0) {
+                if (!dir.exists() && !dir.mkdirs()) {
+                    SpiderDebug.log("vlc-trust", "mkdir failed %s", dir.getAbsolutePath());
+                    return null;
+                }
+                try (InputStream in = context.getAssets().open("cacert.pem");
+                     OutputStream out = new FileOutputStream(target)) {
+                    byte[] buffer = new byte[16384];
+                    int count;
+                    while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
+                }
+            }
+            SpiderDebug.log("vlc-trust", "ready dir=%s size=%d sdk=%d", dir.getAbsolutePath(), target.length(), android.os.Build.VERSION.SDK_INT);
+            return dir.getAbsolutePath();
+        } catch (Throwable e) {
+            SpiderDebug.log("vlc-trust", "failed %s: %s", e.getClass().getSimpleName(), e.getMessage() == null ? "" : e.getMessage());
+            return null;
+        }
     }
 
     int getDecode() {
