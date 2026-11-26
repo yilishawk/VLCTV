@@ -214,6 +214,41 @@ public class Updater implements UpdateTransfer.Callback, UpdateListener {
         return root.getClass().getSimpleName() + (TextUtils.isEmpty(root.getMessage()) ? "" : ": " + root.getMessage());
     }
 
+    /**
+     * 检测更新/发行说明与下载共用同一个用户配置的 GitHub 加速代理。
+     * 但很多免费加速站只代理 github.com 的发布资产，不代理 api.github.com，
+     * 所以这里代理优先、失败自动直连重试，避免因为代理不兼容 API 而误报「检查失败」。
+     */
+    private static String githubApiString(String url) throws java.io.IOException {
+        return githubApiString(url, GITHUB_API_HEADERS);
+    }
+
+    private static String githubApiString(String url, Map<String, String> headers) throws java.io.IOException {
+        String proxied = url;
+        boolean useProxy = false;
+        try {
+            GithubProxy.Config proxy = GithubProxy.resolve(Setting.getUpdateGithubProxy(), Setting.getUpdateGithubProxyUrl(), Setting.getUpdateGithubProxyMode());
+            proxied = proxy.rewrite(url);
+            useProxy = !proxied.equals(url);
+        } catch (Exception e) {
+            SpiderDebug.log("update", "proxy rewrite failed url=%s cause=%s", url, describeStatic(e));
+        }
+        if (useProxy) {
+            try {
+                return UpdateHttp.string(proxied, headers, GITHUB_REQUEST_TIMEOUT_MS);
+            } catch (Exception e) {
+                SpiderDebug.log("update", "proxied api failed url=%s cause=%s, retry direct", proxied, describeStatic(e));
+            }
+        }
+        return UpdateHttp.string(url, headers, GITHUB_REQUEST_TIMEOUT_MS);
+    }
+
+    private static String describeStatic(Throwable e) {
+        Throwable root = e;
+        for (int i = 0; i < 8 && root.getCause() != null && root.getCause() != root; i++) root = root.getCause();
+        return root.getClass().getSimpleName() + (TextUtils.isEmpty(root.getMessage()) ? "" : ": " + root.getMessage());
+    }
+
     private Update getUpdate(String channel) {
         return Update.CHANNEL_BETA.equals(channel) ? getGithubBetaUpdate(channel) : getGithubStableUpdate(channel);
     }
@@ -221,7 +256,7 @@ public class Updater implements UpdateTransfer.Callback, UpdateListener {
     private Update getGithubStableUpdate(String channel) {
         String url = Github.getLatestReleaseApi();
         try {
-            JSONObject release = new JSONObject(UpdateHttp.string(url, GITHUB_API_HEADERS, GITHUB_REQUEST_TIMEOUT_MS));
+            JSONObject release = new JSONObject(githubApiString(url));
             return readGithubReleaseUpdate(channel, release);
         } catch (Exception e) {
             // 以前这里 return Update.empty(channel) 且不设 error ⇒ release 列表请求失败
@@ -236,7 +271,7 @@ public class Updater implements UpdateTransfer.Callback, UpdateListener {
         String manifestName = getManifestName(channel);
         String url = Github.getReleasesApi();
         try {
-            JSONArray releases = new JSONArray(UpdateHttp.string(url, GITHUB_API_HEADERS, GITHUB_REQUEST_TIMEOUT_MS));
+            JSONArray releases = new JSONArray(githubApiString(url));
             for (int i = 0; i < releases.length(); i++) {
                 JSONObject release = releases.optJSONObject(i);
                 if (release == null || !isBetaRelease(release)) continue;
@@ -283,7 +318,7 @@ public class Updater implements UpdateTransfer.Callback, UpdateListener {
     private Update readUpdate(String channel, String manifestUrl, Map<String, String> headers, String fallbackNotes) {
         Update update = Update.empty(channel);
         try {
-            String text = UpdateHttp.string(manifestUrl, headers, GITHUB_REQUEST_TIMEOUT_MS);
+            String text = githubApiString(manifestUrl, headers);
             if (TextUtils.isEmpty(text)) throw new IllegalStateException("Empty update manifest: " + manifestUrl);
             JSONObject object = new JSONObject(text);
             update.name = object.optString("name");
@@ -386,7 +421,7 @@ public class Updater implements UpdateTransfer.Callback, UpdateListener {
 
     private String readReleaseNotes(String tag) {
         try {
-            return new JSONObject(UpdateHttp.string(Github.getReleaseApi(tag), GITHUB_API_HEADERS, GITHUB_REQUEST_TIMEOUT_MS)).optString("body");
+            return new JSONObject(githubApiString(Github.getReleaseApi(tag))).optString("body");
         } catch (Exception ignored) {
             return "";
         }
