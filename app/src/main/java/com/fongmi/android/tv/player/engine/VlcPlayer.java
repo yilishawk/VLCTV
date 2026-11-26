@@ -107,9 +107,32 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         // 复用 app 自带的 Mozilla CA 包，让 VLC 的 gnutls 也能验通这些链。
         String trustDir = prepareBundledTrustDir(context);
         if (trustDir != null) args.add("--gnutls-dir-trust=" + trustDir);
+        // VLC native 日志不进 logcat，debug 模式下写到文件供 /debug/vlc 读取，
+        // 用来定位 native 层故障（例如 AES-128 HLS 的 key 加载/demux 失败）。
+        String nativeLog = prepareNativeLog(context);
+        if (nativeLog != null) {
+            args.add("--file-logging");
+            args.add("--logfile=" + nativeLog);
+            args.add("--log-verbose=2");
+        }
         libVLC = new LibVLC(context, args);
         vlc = new MediaPlayer(libVLC);
         vlc.setEventListener(this);
+    }
+
+    /** debug 开启时让 VLC native 写日志文件；每次启动截断，避免无限增长。 */
+    private static String prepareNativeLog(Context context) {
+        if (!com.fongmi.android.tv.setting.Setting.isDebugLog()) return null;
+        File file = new File(context.getFilesDir(), "vlc-native.log");
+        try {
+            FileOutputStream out = new FileOutputStream(file, false);
+            out.close();
+            SpiderDebug.log("vlc-native", "logfile=%s", file.getAbsolutePath());
+            return file.getAbsolutePath();
+        } catch (Throwable e) {
+            SpiderDebug.log("vlc-native", "failed %s: %s", e.getClass().getSimpleName(), e.getMessage() == null ? "" : e.getMessage());
+            return null;
+        }
     }
 
     /** 把 assets/cacert.pem 落到 filesDir 供 VLC gnutls 读取；失败返回 null，退回系统行为。 */
