@@ -41,6 +41,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Media3 {@link SimpleBasePlayer} adapter around LibVLC.
@@ -53,6 +54,8 @@ import java.util.List;
 class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, IVLCVout.OnNewVideoLayoutListener {
 
     private static final String TAG = "VlcPlayer";
+
+    private static final AtomicBoolean NATIVE_LOG_CAPTURED = new AtomicBoolean(false);
 
     private static final Commands COMMANDS = new Commands.Builder()
             .add(COMMAND_PLAY_PAUSE)
@@ -107,31 +110,53 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         // 复用 app 自带的 Mozilla CA 包，让 VLC 的 gnutls 也能验通这些链。
         String trustDir = prepareBundledTrustDir(context);
         if (trustDir != null) args.add("--gnutls-dir-trust=" + trustDir);
-        // VLC native 日志不进 logcat，debug 模式下写到文件供 /debug/vlc 读取，
-        // 用来定位 native 层故障（例如 AES-128 HLS 的 key 加载/demux 失败）。
-        String nativeLog = prepareNativeLog(context);
-        if (nativeLog != null) {
-            args.add("--file-logging");
-            args.add("--logfile=" + nativeLog);
-            args.add("--log-verbose=2");
-        }
+        // VLC native 日志默认走 Android logcat，不是 logcat 的反面：libvlc Android 构建里
+        // --file-logging 即使参数存在也不会真正落盘（实测 vlc-native.log 为 0 字节）。
+        // 所以 debug 时用 --verbose=2 提高 native 输出级别，再由 prepareNativeLog() 捕获 logcat 写文件。
+        if (com.fongmi.android.tv.setting.Setting.isDebugLog()) args.add("--verbose=2");
+        prepareNativeLog(context);
         libVLC = new LibVLC(context, args);
         vlc = new MediaPlayer(libVLC);
         vlc.setEventListener(this);
     }
 
-    /** debug 开启时让 VLC native 写日志文件；每次启动截断，避免无限增长。 */
-    private static String prepareNativeLog(Context context) {
-        if (!com.fongmi.android.tv.setting.Setting.isDebugLog()) return null;
-        File file = new File(context.getFilesDir(), "vlc-native.log");
+    /** debug 开启时捕获 logcat 里的 VLC native 日志到文件，供 /debug/vlc 导出。只启动一次。 */
+    private static void prepareNativeLog(Context context) {
+        if (!com.fongmi.android.tv.setting.Setting.isDebugLog()) return;
+        if (NATIVE_LOG_CAPTURED.compareAndSet(false, true)) {
+            File file = new File(context.getFilesDir(), "vlc-native.log");
+            try {
+                new FileOutputStream(file, false).close();
+                Thread thread = new Thread(() -> captureLogcat(file), "vlc-native-log");
+                thread.setDaemon(true);
+                thread.start();
+                SpiderDebug.log("vlc-native", "capture started file=%s", file.getAbsolutePath());
+            } catch (Throwable e) {
+                SpiderDebug.log("vlc-native", "start failed %s: %s", e.getClass().getSimpleName(), e.getMessage() == null ? "" : e.getMessage());
+            }
+        }
+    }
+
+    /** 过滤 VLC 相关 tag 的 logcat 行写入文件；VLC native 日志的 tag 不固定，用宽松匹配。 */
+    private static void captureLogcat(File file) {
+        Process process = null;
         try {
-            FileOutputStream out = new FileOutputStream(file, false);
-            out.close();
-            SpiderDebug.log("vlc-native", "logfile=%s", file.getAbsolutePath());
-            return file.getAbsolutePath();
+            process = Runtime.getRuntime().exec(new String[]{"logcat", "-v", "threadtime"});
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream(), java.nio.charset.StandardCharsets.UTF_8));
+                 java.io.Writer writer = new java.io.OutputStreamWriter(new FileOutputStream(file, true), java.nio.charset.StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.contains("VLC") || line.contains("vlc") || line.contains("GnuTLS") || line.contains("gnutls") || line.contains("libvlc")) {
+                        writer.write(line);
+                        writer.write('\n');
+                        writer.flush();
+                    }
+                }
+            }
         } catch (Throwable e) {
-            SpiderDebug.log("vlc-native", "failed %s: %s", e.getClass().getSimpleName(), e.getMessage() == null ? "" : e.getMessage());
-            return null;
+            SpiderDebug.log("vlc-native", "capture failed %s: %s", e.getClass().getSimpleName(), e.getMessage() == null ? "" : e.getMessage());
+        } finally {
+            if (process != null) process.destroy();
         }
     }
 
