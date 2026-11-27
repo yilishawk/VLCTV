@@ -293,6 +293,10 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
             return;
         }
         vlc.stop();
+        // Switching source destroys the old Vout. Detach the views so the new Vout
+        // can bind its own Surface; otherwise areViewsAttached() stays true and
+        // attachOutput() is skipped, leaving the previous source's last frame on screen.
+        clearOutput();
         releaseMedia();
         Media media = new Media(libVLC, Uri.parse(url));
         if (decode == PlayerEngine.SOFT) media.setHWDecoderEnabled(false, false);
