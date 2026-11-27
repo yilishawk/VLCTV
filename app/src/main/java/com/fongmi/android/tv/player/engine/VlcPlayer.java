@@ -327,7 +327,8 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         // can bind its own Surface; otherwise areViewsAttached() stays true and
         // attachOutput() is skipped, leaving the previous source's last frame on screen.
         clearOutput();
-        hlsProxy.clear();
+        // 不要在这里 clear()：加密流的 session 是后台 proxy() 刚建的，
+        // 清掉它会导致 VLC 访问 /vlc/index.m3u8 时 expired。proxy() 内已有 TTL prune。
         releaseMedia();
         Media media = new Media(libVLC, Uri.parse(url));
         if (decode == PlayerEngine.SOFT) media.setHWDecoderEnabled(false, false);
