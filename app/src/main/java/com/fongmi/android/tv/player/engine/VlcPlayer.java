@@ -295,6 +295,12 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         vlc.stop();
         releaseMedia();
         Media media = new Media(libVLC, Uri.parse(url));
+        // VLC 3.x 自带 adaptive demuxer 对 AES-128 加密 HLS 解密失败：native 日志显示拿到
+        // key 和 ts 后直接 Failed to create demuxer 0x0 / no valid streams，且全程无 crypt
+        // 模块参与；同一 key 本地能解出标准 TS，说明流/key 没问题，是 adaptive 解密路径的锅。
+        // 对 HLS 强制走 FFmpeg avformat demuxer（其 hls demuxer 的 AES-128 解密成熟）。
+        // per-media option，且只加在 .m3u8 上，非 HLS 流保持 VLC 默认 demux 行为。
+        if (url.toLowerCase().contains(".m3u8")) media.addOption(":demux=avformat");
         if (decode == PlayerEngine.SOFT) media.setHWDecoderEnabled(false, false);
         if (repeatOne) media.addOption(":input-repeat=65535");
         prepared = false;
