@@ -378,6 +378,12 @@ public final class VlcHlsProxy extends NanoHTTPD {
     }
 
     private static void log(String format, Object... args) {
+        // 用 Log.d 直接输出，不受 debug 开关限制（SpiderDebug 在 debug 关闭时不落 logcat），
+        // 这样真机上代理的探测/取 key/serve 全过程都能抓到，便于定位。
+        try {
+            android.util.Log.d("VlcHlsProxy", String.format(java.util.Locale.US, format, args));
+        } catch (Throwable ignored) {
+        }
         SpiderDebug.log(TAG, format, args);
     }
 
