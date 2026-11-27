@@ -41,6 +41,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -80,6 +81,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
     private final LibVLC libVLC;
     private final MediaPlayer vlc;
     private final int decode;
+    private final VlcHlsProxy hlsProxy;
 
     private MediaItem mediaItem;
     private Object videoOutput;
@@ -118,6 +120,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         libVLC = new LibVLC(context, args);
         vlc = new MediaPlayer(libVLC);
         vlc.setEventListener(this);
+        hlsProxy = new VlcHlsProxy();
     }
 
     /** debug 开启时捕获 logcat 里的 VLC native 日志到文件，供 /debug/vlc 导出。只启动一次。 */
@@ -284,6 +287,8 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         return prepared && playbackState == Player.STATE_READY && vlc.isPlaying();
     }
 
+    private int openGeneration;
+
     private void openCurrent() {
         if (mediaItem == null) return;
         String url = mediaItem.localConfiguration == null ? null : mediaItem.localConfiguration.uri.toString();
@@ -292,11 +297,37 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
             invalidateState();
             return;
         }
+        final int generation = ++openGeneration;
+        // AES-128 加密 HLS：本 libvlc 的 native 解密路径是坏的，走本地明文代理。
+        // 探测要取 m3u8 + key，必须在后台线程做（播放器回调在主线程）。
+        // 只有探测确认是加密流才启用代理，其余一律走原 URL，影响面压到最小。
+        if (url.toLowerCase(java.util.Locale.US).contains(".m3u8")) {
+            Map<String, String> headers = com.fongmi.android.tv.player.exo.ExoUtil.extractHeaders(mediaItem);
+            new Thread(() -> {
+                String playable = hlsProxy.proxy(url, headers);
+                final String resolved = playable == null ? url : playable;
+                new android.os.Handler(Looper.getMainLooper()).post(() -> {
+                    if (generation != openGeneration) return; // 已被后续切源取代，丢弃
+                    openUrl(resolved);
+                });
+            }, "vlc-hls-resolve").start();
+            // 探测期间先把状态置为缓冲，避免界面以为还在播上一个源
+            prepared = false;
+            loading = true;
+            playbackState = Player.STATE_BUFFERING;
+            invalidateState();
+            return;
+        }
+        openUrl(url);
+    }
+
+    private void openUrl(String url) {
         vlc.stop();
         // Switching source destroys the old Vout. Detach the views so the new Vout
         // can bind its own Surface; otherwise areViewsAttached() stays true and
         // attachOutput() is skipped, leaving the previous source's last frame on screen.
         clearOutput();
+        hlsProxy.clear();
         releaseMedia();
         Media media = new Media(libVLC, Uri.parse(url));
         if (decode == PlayerEngine.SOFT) media.setHWDecoderEnabled(false, false);
@@ -504,6 +535,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
     @Override
     protected ListenableFuture<?> handleSetMediaItems(List<MediaItem> mediaItems, int startIndex, long startPositionMs) {
         mediaItem = mediaItems.isEmpty() ? null : mediaItems.get(0);
+        openGeneration++; // 让尚未完成的明文代理探测失效
         pendingSeekMs = startPositionMs > 0 ? startPositionMs : C.TIME_UNSET;
         playbackState = Player.STATE_IDLE;
         loading = false;
@@ -557,8 +589,10 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
 
     @Override
     protected ListenableFuture<?> handleRelease() {
+        openGeneration++;
         stopInternal();
         clearOutput();
+        hlsProxy.release();
         vlc.setEventListener(null);
         vlc.release();
         libVLC.release();
