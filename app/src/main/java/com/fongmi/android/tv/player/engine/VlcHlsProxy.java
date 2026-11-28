@@ -41,8 +41,9 @@ import okhttp3.Request;
  * HTTP 层：取 key、按分片序号做 AES-128-CBC 解密，输出去掉 {@code #EXT-X-KEY} 的明文 m3u8 和明文 TS，
  * 让 VLC 走它本来就擅长的普通 HLS 路径（这条路径已真机验证能解码出画面）。
  *
- * <p>只在检测到 {@code #EXT-X-KEY:METHOD=AES-128} 的单层 m3u8 时启用；非加密流、master playlist、
- * fMP4（EXT-X-MAP）、byte range 一律返回 null，由调用方直接用原 URL，影响面压到最小。
+ * <p>支持两类单层 m3u8：（1）AES-128 加密流，取 key 解密后输出明文；（2）普通非加密流，
+ * 原样透传分片但同样走本地缓存/预加载，让进度条能显示真实预加载区间。master playlist
+ * （多码率）、fMP4（EXT-X-MAP）、byte range 一律返回 null，由调用方直接用原 URL，交给 VLC 原生处理。
  */
 public final class VlcHlsProxy extends NanoHTTPD {
 
@@ -208,8 +209,8 @@ public final class VlcHlsProxy extends NanoHTTPD {
     }
 
     /**
-     * 探测 url 是否为受支持的 AES-128 单层 HLS。是则建立会话并返回本地明文代理 URL，
-     * 否则返回 null（调用方直接用原 URL）。探测/取 key 失败一律降级返回 null。
+     * 探测 url 是否为受支持的单层 HLS（加密 AES-128 或普通非加密）。是则建立会话并返回本地代理 URL，
+     * 否则返回 null（调用方直接用原 URL）。master/fMP4/byterange 不在支持范围；探测/取 key 失败降级返回 null。
      */
     public synchronized String proxy(String url, Map<String, String> headers) {
         if (TextUtils.isEmpty(url)) return null;
@@ -224,27 +225,40 @@ public final class VlcHlsProxy extends NanoHTTPD {
             log("probe failed, fallback to origin: %s", err(e));
             return null;
         }
-        CipherInfo cipher = detectCipher(fetched.text, fetched.finalUrl);
-        if (cipher == null) {
-            log("not aes-128 single-layer hls, fallback to origin url=%s", shortUrl(url));
+        PlaylistKind kind = probe(fetched.text, fetched.finalUrl);
+        if (kind == PlaylistKind.UNSUPPORTED) {
+            log("master/fmp4/byterange hls, fallback to origin url=%s", shortUrl(url));
             return null;
         }
-        byte[] key;
-        try {
-            key = fetchKey(cipher.keyUrl, safeHeaders);
-            if (key == null || key.length != 16) {
-                log("bad key length, fallback key=%s", key == null ? -1 : key.length);
+        byte[] key = null;
+        byte[] iv = null;
+        String keyUri = null;
+        if (kind == PlaylistKind.ENCRYPTED) {
+            CipherInfo cipher = detectCipher(fetched.text, fetched.finalUrl);
+            if (cipher == null) {
+                log("cipher vanished, fallback url=%s", shortUrl(url));
                 return null;
             }
-        } catch (Throwable e) {
-            log("fetch key failed, fallback: %s", err(e));
-            return null;
+            try {
+                key = fetchKey(cipher.keyUrl, safeHeaders);
+                if (key == null || key.length != 16) {
+                    log("bad key length, fallback key=%s", key == null ? -1 : key.length);
+                    return null;
+                }
+                iv = cipher.iv;
+                keyUri = cipher.keyUrl;
+            } catch (Throwable e) {
+                log("fetch key failed, fallback: %s", err(e));
+                return null;
+            }
         }
         int id = nextSession.incrementAndGet();
-        sessions.put(id, new Session(url, safeHeaders, key, cipher.iv));
+        Session s = new Session(url, safeHeaders, key, iv);
+        s.keyUri = keyUri;
+        sessions.put(id, s);
         prune();
         String proxyUrl = baseUrl() + "/vlc/index.m3u8?s=" + id;
-        log("enabled session=%d key=%s url=%s proxy=%s", id, cipher.keyUrl, shortUrl(url), proxyUrl);
+        log("enabled session=%d kind=%s key=%s url=%s proxy=%s", id, kind, keyUri, shortUrl(url), proxyUrl);
         return proxyUrl;
     }
 
@@ -300,22 +314,32 @@ public final class VlcHlsProxy extends NanoHTTPD {
         Session s = sessions.get(id);
         if (s == null) return error("expired session");
         Fetched fetched = fetchText(s.url, s.headers);
-        CipherInfo cipher = detectCipher(fetched.text, fetched.finalUrl);
-        if (cipher == null || !TextUtils.equals(cipher.keyUrl, keyUrlOf(s))) {
-            // key 变了：按新 URI 重新取，并更新会话
-            if (cipher == null) return error("playlist not encrypted");
-            byte[] key;
-            try {
-                key = fetchKey(cipher.keyUrl, s.headers);
-            } catch (Throwable e) {
-                return error("fetch key failed: " + err(e));
+        PlaylistKind kind = probe(fetched.text, fetched.finalUrl);
+        if (kind == PlaylistKind.UNSUPPORTED) return error("unsupported playlist");
+        if (kind == PlaylistKind.ENCRYPTED) {
+            CipherInfo cipher = detectCipher(fetched.text, fetched.finalUrl);
+            if (cipher == null) return error("cipher vanished");
+            if (!TextUtils.equals(cipher.keyUrl, keyUrlOf(s))) {
+                // 动态 key：key URI 变了就重新取并更新会话
+                byte[] key;
+                try {
+                    key = fetchKey(cipher.keyUrl, s.headers);
+                } catch (Throwable e) {
+                    return error("fetch key failed: " + err(e));
+                }
+                if (key == null || key.length != 16) return error("bad key length");
+                s.key = key;
+                s.iv = cipher.iv;
+                s.keyUri = cipher.keyUrl;
             }
-            if (key == null || key.length != 16) return error("bad key length");
-            s.key = key;
-            s.iv = cipher.iv;
-            s.keyUri = cipher.keyUrl;
+        } else {
+            // 普通明文 HLS：清掉可能残留的 key 状态，rewrite 会原样透传分片
+            s.key = null;
+            s.iv = null;
+            s.keyUri = null;
         }
         RewriteResult result = rewrite(fetched.finalUrl, fetched.text, id, s);
+        if (result == null) return error("playlist changed to unsupported format");
         byte[] data = result.playlist.getBytes(StandardCharsets.UTF_8);
         log("playlist session=%d segments=%d bytes=%d keyUri=%s", id, result.segments, data.length, shortUrl(s.keyUri));
         return noCache(newFixedLengthResponse(Status.OK, MIME_M3U8, new ByteArrayInputStream(data), data.length));
@@ -420,6 +444,32 @@ public final class VlcHlsProxy extends NanoHTTPD {
             seq >>>= 8;
         }
         return iv;
+    }
+
+    /**
+     * 判断 m3u8 是否可代理：master（多码率）、fMP4/EXT-X-MAP、byterange 交给 VLC 原生；
+     * 其余单层列表若有 AES-128 KEY 则 ENCRYPTED，否则 PLAIN。
+     */
+    private static PlaylistKind probe(String text, String playlistUrl) {
+        if (TextUtils.isEmpty(text)) return PlaylistKind.UNSUPPORTED;
+        boolean encrypted = false;
+        boolean hasSegment = false;
+        for (String raw : text.split("\n")) {
+            String line = raw.trim();
+            String upper = line.toUpperCase(Locale.US);
+            if (upper.startsWith("#EXT-X-STREAM-INF") || upper.startsWith("#EXT-X-MAP:")
+                    || upper.startsWith("#EXT-X-BYTERANGE:")) return PlaylistKind.UNSUPPORTED;
+            if (upper.startsWith("#EXT-X-KEY:")) {
+                String method = attr(line, "METHOD");
+                if (!"AES-128".equalsIgnoreCase(method)) return PlaylistKind.UNSUPPORTED;
+                if (TextUtils.isEmpty(attr(line, "URI"))) return PlaylistKind.UNSUPPORTED;
+                encrypted = true;
+            } else if (!line.isEmpty() && !line.startsWith("#")) {
+                hasSegment = true;
+            }
+        }
+        if (!hasSegment) return PlaylistKind.UNSUPPORTED;
+        return encrypted ? PlaylistKind.ENCRYPTED : PlaylistKind.PLAIN;
     }
 
     private static CipherInfo detectCipher(String text, String playlistUrl) {
@@ -579,6 +629,8 @@ public final class VlcHlsProxy extends NanoHTTPD {
         }
         SpiderDebug.log(TAG, format, args);
     }
+
+    private enum PlaylistKind {ENCRYPTED, PLAIN, UNSUPPORTED}
 
     private static final class Fetched {
         final String text;

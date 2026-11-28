@@ -82,6 +82,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
     private final MediaPlayer vlc;
     private final int decode;
     private final VlcHlsProxy hlsProxy;
+    private final VlcFileProxy fileProxy;
 
     private MediaItem mediaItem;
     private Object videoOutput;
@@ -121,6 +122,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         vlc = new MediaPlayer(libVLC);
         vlc.setEventListener(this);
         hlsProxy = new VlcHlsProxy();
+        fileProxy = new VlcFileProxy();
     }
 
     /** debug 开启时捕获 logcat 里的 VLC native 日志到文件，供 /debug/vlc 导出。只启动一次。 */
@@ -249,9 +251,11 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         if (mediaItem != null) {
             long duration = durationMs();
             long position = positionMs();
-            // 加密 HLS 走明文代理：用代理已缓存的连续终点显示真实预加载进度；
-            // 非代理流（普通视频）无会话，bufferedEndMs 返回 UNSET，维持原来的 +1s。
-            long proxyEnd = hlsProxy.bufferedEndMs(position);
+            // 预加载代理（HLS 分片 / 单文件 Range）已缓存的连续终点显示真实预加载进度；
+            // 两个代理同一时刻只有一个有会话，取较大值即可；都无会话维持原来的 +1s。
+            long hlsEnd = hlsProxy.bufferedEndMs(position);
+            long fileEnd = duration == C.TIME_UNSET ? -1L : fileProxy.bufferedEndMs(position, duration);
+            long proxyEnd = Math.max(hlsEnd, fileEnd);
             long buffered = proxyEnd >= 0
                     ? Math.max(position, Math.min(duration == C.TIME_UNSET ? proxyEnd : duration, proxyEnd))
                     : Math.max(position, Math.min(duration == C.TIME_UNSET ? position : duration, position + 1000));
@@ -304,19 +308,24 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         }
         final int generation = ++openGeneration;
         hlsProxy.cancelPreload(); // 作废上一线路的在途预加载
-        // AES-128 加密 HLS：本 libvlc 的 native 解密路径是坏的，走本地明文代理。
-        // 探测要取 m3u8 + key，必须在后台线程做（播放器回调在主线程）。
-        // 只有探测确认是加密流才启用代理，其余一律走原 URL，影响面压到最小。
-        if (url.toLowerCase(java.util.Locale.US).contains(".m3u8")) {
+        fileProxy.cancelPreload();
+        // 探测要在后台线程做（播放器回调在主线程）：
+        // - m3u8：AES-128 加密流本 libvlc native 解不了，普通单层 m3u8 也走本地代理以便预加载；
+        // - 其它 http(s) 单文件（mp4/flv…）：走 VlcFileProxy 做 Range 分段预加载。
+        // 探测失败/不支持一律用原 URL，影响面压到最小。
+        String lower = url.toLowerCase(java.util.Locale.US);
+        boolean hls = lower.contains(".m3u8");
+        boolean single = !hls && (lower.startsWith("http://") || lower.startsWith("https://"));
+        if (hls || single) {
             Map<String, String> headers = com.fongmi.android.tv.player.exo.ExoUtil.extractHeaders(mediaItem);
             new Thread(() -> {
-                String playable = hlsProxy.proxy(url, headers);
+                String playable = hls ? hlsProxy.proxy(url, headers) : fileProxy.proxy(url, headers);
                 final String resolved = playable == null ? url : playable;
                 new android.os.Handler(Looper.getMainLooper()).post(() -> {
                     if (generation != openGeneration) return; // 已被后续切源取代，丢弃
                     openUrl(resolved);
                 });
-            }, "vlc-hls-resolve").start();
+            }, "vlc-source-resolve").start();
             // 探测期间先把状态置为缓冲，避免界面以为还在播上一个源
             prepared = false;
             loading = true;
@@ -600,6 +609,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         stopInternal();
         clearOutput();
         hlsProxy.release();
+        fileProxy.release();
         vlc.setEventListener(null);
         vlc.release();
         libVLC.release();
@@ -717,8 +727,12 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
                 invalidateState();
             }
             case MediaPlayer.Event.LengthChanged, MediaPlayer.Event.TimeChanged -> {
-                // 边播边预加载：进度变化时让代理提前抓未看的分片（由 VLC 的预加载设置控制开关）
-                if (event.type == MediaPlayer.Event.TimeChanged) hlsProxy.preloadAround(positionMs());
+                // 边播边预加载：进度变化时让两个代理提前抓未看的内容（由 VLC 的预加载设置控制开关）
+                if (event.type == MediaPlayer.Event.TimeChanged) {
+                    long pos = positionMs();
+                    hlsProxy.preloadAround(pos);
+                    fileProxy.preloadAround(pos, durationMs());
+                }
                 invalidateState();
             }
             case MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected, MediaPlayer.Event.ESDeleted -> {
