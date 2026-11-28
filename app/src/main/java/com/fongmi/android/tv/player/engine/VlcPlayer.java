@@ -298,6 +298,7 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
             return;
         }
         final int generation = ++openGeneration;
+        hlsProxy.cancelPreload(); // 作废上一线路的在途预加载
         // AES-128 加密 HLS：本 libvlc 的 native 解密路径是坏的，走本地明文代理。
         // 探测要取 m3u8 + key，必须在后台线程做（播放器回调在主线程）。
         // 只有探测确认是加密流才启用代理，其余一律走原 URL，影响面压到最小。
@@ -710,7 +711,11 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
                 newlyRenderedFirstFrame = true;
                 invalidateState();
             }
-            case MediaPlayer.Event.LengthChanged, MediaPlayer.Event.TimeChanged -> invalidateState();
+            case MediaPlayer.Event.LengthChanged, MediaPlayer.Event.TimeChanged -> {
+                // 边播边预加载：进度变化时让代理提前抓未看的分片（由 VLC 的预加载设置控制开关）
+                if (event.type == MediaPlayer.Event.TimeChanged) hlsProxy.preloadAround(positionMs());
+                invalidateState();
+            }
             case MediaPlayer.Event.ESAdded, MediaPlayer.Event.ESSelected, MediaPlayer.Event.ESDeleted -> {
                 refreshTracks();
                 probeVideoSize();
