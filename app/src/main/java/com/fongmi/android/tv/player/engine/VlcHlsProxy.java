@@ -236,7 +236,12 @@ public final class VlcHlsProxy extends NanoHTTPD {
                 return null;
             }
             playUrl = variant;
-            fetched = fetchText(variant, safeHeaders);
+            try {
+                fetched = fetchText(variant, safeHeaders);
+            } catch (Throwable e) {
+                log("fetch variant failed, fallback: %s", err(e));
+                return null;
+            }
             kind = probe(fetched.text, fetched.finalUrl);
             log("master depth=%d variant=%s kind=%s", depth + 1, shortUrl(variant), kind);
         }
