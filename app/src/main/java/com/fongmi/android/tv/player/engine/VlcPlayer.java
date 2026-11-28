@@ -249,7 +249,12 @@ class VlcPlayer extends SimpleBasePlayer implements MediaPlayer.EventListener, I
         if (mediaItem != null) {
             long duration = durationMs();
             long position = positionMs();
-            long buffered = Math.max(position, Math.min(duration == C.TIME_UNSET ? position : duration, position + 1000));
+            // 加密 HLS 走明文代理：用代理已缓存的连续终点显示真实预加载进度；
+            // 非代理流（普通视频）无会话，bufferedEndMs 返回 UNSET，维持原来的 +1s。
+            long proxyEnd = hlsProxy.bufferedEndMs(position);
+            long buffered = proxyEnd >= 0
+                    ? Math.max(position, Math.min(duration == C.TIME_UNSET ? proxyEnd : duration, proxyEnd))
+                    : Math.max(position, Math.min(duration == C.TIME_UNSET ? position : duration, position + 1000));
             builder.setContentPositionMs(isPlayingInternal()
                     ? PositionSupplier.getExtrapolating(position, playbackParameters.speed)
                     : PositionSupplier.getConstant(position));
