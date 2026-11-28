@@ -510,6 +510,7 @@ public final class PlaybackPerformanceDialog extends DialogFragment {
         return switch (PlayerSetting.getPlayer()) {
             case PlayerSetting.IJK -> "IJK";
             case PlayerSetting.MPV -> "MPV";
+            case PlayerSetting.VLC -> "VLC";
             default -> "EXO";
         };
     }
