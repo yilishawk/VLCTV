@@ -189,6 +189,25 @@ public final class VlcHlsProxy extends NanoHTTPD {
     }
 
     /**
+     * 返回从 positionMs 往后、已缓存分片的连续终点（毫秒）。用于进度条显示真实预加载进度。
+     * 只算连续区间：中间有分片没缓存就停在断点前，不虚报。没有代理会话时返回 C.TIME_UNSET。
+     */
+    public long bufferedEndMs(long positionMs) {
+        int id = currentSessionId();
+        Session s = sessions.get(id);
+        if (s == null || s.segments.isEmpty()) return -1L; // C.TIME_UNSET
+        long end = -1L;
+        synchronized (cache) {
+            for (Segment seg : s.segments) {
+                if (seg.endMs <= positionMs) continue;    // 已播过的跳过
+                if (!cache.containsKey(seg.target.url)) break; // 断点：后面的不算
+                end = seg.endMs;
+            }
+        }
+        return end;
+    }
+
+    /**
      * 探测 url 是否为受支持的 AES-128 单层 HLS。是则建立会话并返回本地明文代理 URL，
      * 否则返回 null（调用方直接用原 URL）。探测/取 key 失败一律降级返回 null。
      */
