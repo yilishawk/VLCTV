@@ -2,6 +2,8 @@ package com.fongmi.android.tv.player.engine;
 
 import android.text.TextUtils;
 
+import com.fongmi.android.tv.setting.PlayerSetting;
+import com.fongmi.android.tv.setting.PreloadSetting;
 import com.fongmi.android.tv.utils.BundledCaTrust;
 import com.github.catvod.crawler.SpiderDebug;
 
@@ -9,11 +11,17 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
@@ -43,12 +51,24 @@ public final class VlcHlsProxy extends NanoHTTPD {
     private static final String MIME_TS = "video/MP2T";
     private static final long SESSION_TTL_MS = TimeUnit.MINUTES.toMillis(30);
 
+    private static final long MAX_CACHE_BYTES = 128L * 1024 * 1024; // 内存缓存硬上限，防止 OOM
+    private static final long PRELOAD_WINDOW_MS = 5 * 60 * 1000L;   // 只预加载未来 5 分钟内的分片
+    private static final int MAX_PRELOAD_PER_TICK = 40;             // 单次 tick 最多提交，防止雪崩
+
     private final OkHttpClient client;
     private final Map<Integer, Session> sessions = new ConcurrentHashMap<>();
     private final Map<String, Target> targets = new ConcurrentHashMap<>();
     private final AtomicInteger nextSession = new AtomicInteger();
     private final AtomicInteger nextTarget = new AtomicInteger();
     private volatile boolean started;
+
+    /** 明文 TS 内存缓存：key=原始 ts URL，LRU，按字节淘汰。serveItem 命中即直接返回。 */
+    private final LinkedHashMap<String, byte[]> cache = new LinkedHashMap<>(16, 0.75f, true);
+    private final AtomicLong cacheBytes = new AtomicLong();
+    private final java.util.Set<String> inFlight = ConcurrentHashMap.newKeySet();
+    private volatile ExecutorService preloadExecutor;
+    private final AtomicInteger preloadGeneration = new AtomicInteger();
+    private volatile long lastPreloadAtMs;
 
     public VlcHlsProxy() {
         super("127.0.0.1", 0);
@@ -57,6 +77,115 @@ public final class VlcHlsProxy extends NanoHTTPD {
                 .readTimeout(20, TimeUnit.SECONDS)
                 .writeTimeout(20, TimeUnit.SECONDS))
                 .build();
+    }
+
+    /**
+     * 播放进度回调：预加载当前时间之后、窗口内尚未缓存的分片。
+     * 开关/线程数/时长全部读 VLC 自己的预加载设置，与设置界面一致。
+     */
+    public void preloadAround(long positionMs) {
+        if (!PreloadSetting.isPreload(PlayerSetting.VLC)) return;
+        long now = System.currentTimeMillis();
+        if (now - lastPreloadAtMs < 1500) return; // TimeChanged 很频繁，1.5s 节流
+        lastPreloadAtMs = now;
+        int sessionId = currentSessionId();
+        Session s = sessions.get(sessionId);
+        if (s == null || s.segments.isEmpty()) return;
+        long start = Math.max(0, positionMs);
+        long end = start + PRELOAD_WINDOW_MS;
+        int submitted = 0;
+        synchronized (cache) {
+            for (Segment seg : s.segments) {
+                if (submitted >= MAX_PRELOAD_PER_TICK) break;
+                if (seg.endMs <= start) continue;      // 已播过
+                if (seg.startMs >= end) break;         // 超出窗口（segments 按时间有序）
+                if (seg.startMs <= start && seg.endMs > start) continue; // 正在播
+                Target t = seg.target;
+                if (t == null || cache.containsKey(t.url) || inFlight.contains(t.url)) continue;
+                submitPreload(sessionId, t);
+                submitted++;
+            }
+        }
+        if (submitted > 0) log("preload submitted=%d pos=%dms cacheBytes=%d", submitted, positionMs, cacheBytes.get());
+    }
+
+    /** 切源/暂停停止时作废所有在途预加载任务。 */
+    public void cancelPreload() {
+        preloadGeneration.incrementAndGet();
+    }
+
+    private int currentSessionId() {
+        // 只保留一个活跃会话：新会话建立后旧的自然过期；取已建立的最大 id。
+        int id = -1;
+        for (Integer key : sessions.keySet()) if (key != null && key > id) id = key;
+        return id;
+    }
+
+    private void submitPreload(int sessionId, Target t) {
+        if (!inFlight.add(t.url)) return;
+        int generation = preloadGeneration.get();
+        ExecutorService executor = ensurePreloadExecutor();
+        try {
+            executor.execute(() -> {
+                try {
+                    if (generation != preloadGeneration.get()) return;
+                    Session s = sessions.get(sessionId);
+                    if (s == null) return;
+                    byte[] plain = loadAndDecrypt(t, s);
+                    if (plain == null) return;
+                    if (generation != preloadGeneration.get()) return;
+                    putCache(t.url, plain);
+                } catch (Throwable e) {
+                    log("preload failed url=%s err=%s", shortUrl(t.url), err(e));
+                } finally {
+                    inFlight.remove(t.url);
+                }
+            });
+        } catch (Throwable e) {
+            inFlight.remove(t.url);
+        }
+    }
+
+    private synchronized ExecutorService ensurePreloadExecutor() {
+        if (preloadExecutor == null || preloadExecutor.isShutdown()) {
+            int threads = PreloadSetting.getPreloadThreads(PlayerSetting.VLC);
+            preloadExecutor = Executors.newFixedThreadPool(Math.max(1, Math.min(4, threads)));
+        }
+        return preloadExecutor;
+    }
+
+    private byte[] loadAndDecrypt(Target t, Session s) throws IOException {
+        try (okhttp3.Response response = fetchBytes(t.url, s.headers)) {
+            if (!response.isSuccessful() || response.body() == null) return null;
+            byte[] body = response.body().bytes();
+            if (t.key == null) return body;
+            try {
+                return decrypt(body, t.key, t.iv);
+            } catch (Throwable e) {
+                log("preload decrypt failed url=%s err=%s", shortUrl(t.url), err(e));
+                return null;
+            }
+        }
+    }
+
+    private synchronized void putCache(String key, byte[] data) {
+        if (data == null || data.length == 0) return;
+        long limit = Math.min(MAX_CACHE_BYTES, PreloadSetting.getPreloadSizeBytes(PlayerSetting.VLC));
+        if (data.length > limit) return;
+        byte[] old = cache.put(key, data);
+        if (old != null) cacheBytes.addAndGet(-old.length);
+        cacheBytes.addAndGet(data.length);
+        while (cacheBytes.get() > limit && !cache.isEmpty()) {
+            String eldest = cache.keySet().iterator().next();
+            byte[] removed = cache.remove(eldest);
+            if (removed != null) cacheBytes.addAndGet(-removed.length);
+        }
+    }
+
+    private byte[] getCache(String key) {
+        synchronized (cache) {
+            return cache.get(key);
+        }
     }
 
     /**
@@ -101,12 +230,21 @@ public final class VlcHlsProxy extends NanoHTTPD {
     }
 
     public void clear() {
+        cancelPreload();
         sessions.clear();
         targets.clear();
+        synchronized (cache) {
+            cache.clear();
+            cacheBytes.set(0);
+        }
+        inFlight.clear();
     }
 
     public void release() {
         clear();
+        ExecutorService executor = preloadExecutor;
+        if (executor != null) executor.shutdownNow();
+        preloadExecutor = null;
         try {
             stop();
         } catch (Throwable ignored) {
@@ -171,6 +309,11 @@ public final class VlcHlsProxy extends NanoHTTPD {
         Session s = sessions.get(target.sessionId);
         if (s == null) return error("expired session");
 
+        // 预加载命中：直接返回内存缓存的明文 TS，不再走网络
+        byte[] cached = getCache(target.url);
+        if (cached != null) {
+            return noCache(newFixedLengthResponse(Status.OK, MIME_TS, new ByteArrayInputStream(cached), cached.length));
+        }
         byte[] body;
         try (okhttp3.Response response = fetchBytes(target.url, s.headers)) {
             if (!response.isSuccessful() || response.body() == null) {
@@ -178,17 +321,19 @@ public final class VlcHlsProxy extends NanoHTTPD {
             }
             body = response.body().bytes();
         }
-        if (target.key == null) {
-            return noCache(newFixedLengthResponse(Status.OK, MIME_TS, new ByteArrayInputStream(body), body.length));
-        }
         byte[] plain;
-        try {
-            plain = decrypt(body, target.key, target.iv);
-        } catch (Throwable e) {
-            log("decrypt failed id=%s bytes=%d err=%s", tid, body.length, err(e));
-            // 长度不是 16 倍数等异常：原样吐出，不让单分片异常打断整条流
+        if (target.key == null) {
             plain = body;
+        } else {
+            try {
+                plain = decrypt(body, target.key, target.iv);
+            } catch (Throwable e) {
+                log("decrypt failed id=%s bytes=%d err=%s", tid, body.length, err(e));
+                plain = body; // 长度不是 16 倍数等异常：原样吐出，不让单分片异常打断整条流
+            }
         }
+        // 顺手把这次实际播放的分片也放进缓存
+        putCache(target.url, plain);
         return noCache(newFixedLengthResponse(Status.OK, MIME_TS, new ByteArrayInputStream(plain), plain.length));
     }
 
@@ -199,12 +344,18 @@ public final class VlcHlsProxy extends NanoHTTPD {
         long mediaSequence = 0;
         int segmentIndex = 0;
         int segments = 0;
+        double pendingDuration = 0;   // 最近一个 #EXTINF 的时长（秒）
+        long elapsedMs = 0;           // 从 playlist 起始累计的时间
+        List<Segment> parsed = new ArrayList<>();
         for (int i = 0; i < lines.length; i++) {
             String raw = stripCr(lines[i]);
             String line = raw.trim();
             String upper = line.toUpperCase(Locale.US);
             if (upper.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
                 mediaSequence = parseLongAttribute(line, -1);
+                out.append(raw);
+            } else if (upper.startsWith("#EXTINF:")) {
+                pendingDuration = parseExtInf(line);
                 out.append(raw);
             } else if (upper.startsWith("#EXT-X-KEY:")) {
                 // 明文输出：整行剔除，VLC 不再尝试 native 解密
@@ -215,15 +366,23 @@ public final class VlcHlsProxy extends NanoHTTPD {
                 String tid = String.valueOf(nextTarget.incrementAndGet());
                 long seq = mediaSequence + segmentIndex;
                 byte[] iv = s.iv != null ? s.iv : sequenceIv(seq);
-                targets.put(tid, new Target(sessionId, targetUrl, s.key, iv));
+                Target target = new Target(sessionId, targetUrl, s.key, iv);
+                targets.put(tid, target);
+                long startMs = elapsedMs;
+                long endMs = startMs + (long) (pendingDuration * 1000);
+                parsed.add(new Segment(target, startMs, endMs));
+                elapsedMs = endMs;
                 out.append(baseUrl()).append("/vlc/item?s=").append(sessionId).append("&id=").append(tid);
                 segmentIndex++;
                 segments++;
+                pendingDuration = 0;
             } else {
                 out.append(raw);
             }
             if (i < lines.length - 1) out.append('\n');
         }
+        // 保存分片时间轴，供 preloadAround 按播放进度挑未看的分片
+        s.segments = parsed;
         return new RewriteResult(out.toString(), segments);
     }
 
@@ -331,6 +490,21 @@ public final class VlcHlsProxy extends NanoHTTPD {
         }
     }
 
+    /** 解析 #EXTINF:10.5,xxx 里的时长（秒）。 */
+    private static double parseExtInf(String line) {
+        int colon = line.indexOf(':');
+        if (colon < 0) return 0;
+        String value = line.substring(colon + 1).trim();
+        int comma = value.indexOf(',');
+        if (comma >= 0) value = value.substring(0, comma).trim();
+        try {
+            double d = Double.parseDouble(value);
+            return Double.isFinite(d) && d > 0 ? d : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     private static byte[] hexToBytes(String hex) {
         String h = hex.startsWith("0x") || hex.startsWith("0X") ? hex.substring(2) : hex;
         if (h.length() % 2 != 0) return null;
@@ -414,12 +588,26 @@ public final class VlcHlsProxy extends NanoHTTPD {
         byte[] key;
         byte[] iv;
         String keyUri;
+        List<Segment> segments = new ArrayList<>(); // 按播放时间有序
 
         Session(String url, Map<String, String> headers, byte[] key, byte[] iv) {
             this.url = url;
             this.headers = headers;
             this.key = key;
             this.iv = iv;
+        }
+    }
+
+    /** 一个分片在播放时间轴上的位置。 */
+    private static final class Segment {
+        final Target target;
+        final long startMs;
+        final long endMs;
+
+        Segment(Target target, long startMs, long endMs) {
+            this.target = target;
+            this.startMs = startMs;
+            this.endMs = endMs;
         }
     }
 
