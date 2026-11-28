@@ -226,8 +226,22 @@ public final class VlcHlsProxy extends NanoHTTPD {
             return null;
         }
         PlaylistKind kind = probe(fetched.text, fetched.finalUrl);
-        if (kind == PlaylistKind.UNSUPPORTED) {
-            log("master/fmp4/byterange hls, fallback to origin url=%s", shortUrl(url));
+        String playUrl = fetched.finalUrl;
+        // master（多码率）：选带宽最高的子 m3u8 再探测，让普通 master HLS 也走代理预加载。
+        // 最多解析 2 层，防嵌套 master 死循环。
+        for (int depth = 0; kind == PlaylistKind.MASTER && depth < 2; depth++) {
+            String variant = selectVariant(fetched.text, fetched.finalUrl);
+            if (TextUtils.isEmpty(variant)) {
+                log("master has no variant, fallback url=%s", shortUrl(url));
+                return null;
+            }
+            playUrl = variant;
+            fetched = fetchText(variant, safeHeaders);
+            kind = probe(fetched.text, fetched.finalUrl);
+            log("master depth=%d variant=%s kind=%s", depth + 1, shortUrl(variant), kind);
+        }
+        if (kind == PlaylistKind.UNSUPPORTED || kind == PlaylistKind.MASTER) {
+            log("fmp4/byterange/unresolved hls, fallback to origin url=%s", shortUrl(url));
             return null;
         }
         byte[] key = null;
@@ -253,12 +267,13 @@ public final class VlcHlsProxy extends NanoHTTPD {
             }
         }
         int id = nextSession.incrementAndGet();
-        Session s = new Session(url, safeHeaders, key, iv);
+        // 用子 m3u8 的 URL 建会话：servePlaylist 会重新 fetch，必须拿到同一份单层列表而非 master。
+        Session s = new Session(playUrl, safeHeaders, key, iv);
         s.keyUri = keyUri;
         sessions.put(id, s);
         prune();
         String proxyUrl = baseUrl() + "/vlc/index.m3u8?s=" + id;
-        log("enabled session=%d kind=%s key=%s url=%s proxy=%s", id, kind, keyUri, shortUrl(url), proxyUrl);
+        log("enabled session=%d kind=%s key=%s url=%s proxy=%s", id, kind, keyUri, shortUrl(playUrl), proxyUrl);
         return proxyUrl;
     }
 
@@ -315,7 +330,7 @@ public final class VlcHlsProxy extends NanoHTTPD {
         if (s == null) return error("expired session");
         Fetched fetched = fetchText(s.url, s.headers);
         PlaylistKind kind = probe(fetched.text, fetched.finalUrl);
-        if (kind == PlaylistKind.UNSUPPORTED) return error("unsupported playlist");
+        if (kind == PlaylistKind.UNSUPPORTED || kind == PlaylistKind.MASTER) return error("unsupported playlist");
         if (kind == PlaylistKind.ENCRYPTED) {
             CipherInfo cipher = detectCipher(fetched.text, fetched.finalUrl);
             if (cipher == null) return error("cipher vanished");
@@ -447,18 +462,22 @@ public final class VlcHlsProxy extends NanoHTTPD {
     }
 
     /**
-     * 判断 m3u8 是否可代理：master（多码率）、fMP4/EXT-X-MAP、byterange 交给 VLC 原生；
-     * 其余单层列表若有 AES-128 KEY 则 ENCRYPTED，否则 PLAIN。
+     * 判断 m3u8 类型：MASTER（多码率，需解析子列表）；fMP4/EXT-X-MAP、byterange 不支持；
+     * 单层列表若有 AES-128 KEY 则 ENCRYPTED，否则 PLAIN。
      */
     private static PlaylistKind probe(String text, String playlistUrl) {
         if (TextUtils.isEmpty(text)) return PlaylistKind.UNSUPPORTED;
         boolean encrypted = false;
         boolean hasSegment = false;
+        boolean master = false;
         for (String raw : text.split("\n")) {
             String line = raw.trim();
             String upper = line.toUpperCase(Locale.US);
-            if (upper.startsWith("#EXT-X-STREAM-INF") || upper.startsWith("#EXT-X-MAP:")
-                    || upper.startsWith("#EXT-X-BYTERANGE:")) return PlaylistKind.UNSUPPORTED;
+            if (upper.startsWith("#EXT-X-STREAM-INF")) {
+                master = true;
+                continue;
+            }
+            if (upper.startsWith("#EXT-X-MAP:") || upper.startsWith("#EXT-X-BYTERANGE:")) return PlaylistKind.UNSUPPORTED;
             if (upper.startsWith("#EXT-X-KEY:")) {
                 String method = attr(line, "METHOD");
                 if (!"AES-128".equalsIgnoreCase(method)) return PlaylistKind.UNSUPPORTED;
@@ -468,8 +487,58 @@ public final class VlcHlsProxy extends NanoHTTPD {
                 hasSegment = true;
             }
         }
+        if (master) return PlaylistKind.MASTER;
         if (!hasSegment) return PlaylistKind.UNSUPPORTED;
         return encrypted ? PlaylistKind.ENCRYPTED : PlaylistKind.PLAIN;
+    }
+
+    /** 解析 master playlist：取带宽最高的子 m3u8（没有 BANDWIDTH 取第一个），返回绝对 URL。 */
+    private static String selectVariant(String text, String playlistUrl) {
+        String best = null;
+        long bestBw = -1;
+        boolean expectUri = false;
+        long pendingBw = -1;
+        for (String raw : text.split("\n")) {
+            String line = raw.trim();
+            String upper = line.toUpperCase(Locale.US);
+            if (upper.startsWith("#EXT-X-STREAM-INF")) {
+                expectUri = true;
+                pendingBw = attrLong(line, "BANDWIDTH");
+                continue;
+            }
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            if (expectUri) {
+                if (pendingBw > bestBw) {
+                    bestBw = pendingBw;
+                    best = resolve(playlistUrl, line);
+                }
+                expectUri = false;
+                pendingBw = -1;
+            }
+        }
+        if (best == null && !TextUtils.isEmpty(text)) {
+            // 兜底：master 无 STREAM-INF 配对时取第一个非注释行
+            for (String raw : text.split("\n")) {
+                String line = raw.trim();
+                if (!line.isEmpty() && !line.startsWith("#")) return resolve(playlistUrl, line);
+            }
+        }
+        return best;
+    }
+
+    private static long attrLong(String line, String name) {
+        String target = name.toUpperCase(Locale.US);
+        for (String part : line.substring(Math.min(line.indexOf(':') + 1, line.length())).split(",")) {
+            int eq = part.indexOf('=');
+            if (eq <= 0) continue;
+            if (!part.substring(0, eq).trim().toUpperCase(Locale.US).equals(target)) continue;
+            try {
+                return Long.parseLong(part.substring(eq + 1).trim());
+            } catch (NumberFormatException ignored) {
+                return -1;
+            }
+        }
+        return -1;
     }
 
     private static CipherInfo detectCipher(String text, String playlistUrl) {
@@ -630,7 +699,7 @@ public final class VlcHlsProxy extends NanoHTTPD {
         SpiderDebug.log(TAG, format, args);
     }
 
-    private enum PlaylistKind {ENCRYPTED, PLAIN, UNSUPPORTED}
+    private enum PlaylistKind {ENCRYPTED, PLAIN, MASTER, UNSUPPORTED}
 
     private static final class Fetched {
         final String text;
